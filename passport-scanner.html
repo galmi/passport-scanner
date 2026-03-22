@@ -384,10 +384,18 @@ select option{background:var(--surface2)}
 </div>
 
 <script>
+// ── CONFIG — замените на URL вашего прокси ──────────────────────
+// Cloudflare: 'https://passport-proxy.YOUR.workers.dev'
+// Vercel:      'https://YOUR-PROJECT.vercel.app/api/proxy'
+// Local:       'http://localhost:3001/api/proxy'
+const PROXY_URL = 'https://YOUR_PROXY_URL/api/proxy';
+
 // ── STATE ──────────────────────────────────────────────────────────
 const S = {
   stream: null, facingMode: 'environment',
   capturedDataUrl: null, parsed: null, mrzLines: null,
+  // MRZ zone in viewfinder at moment of capture (screen px)
+  vfMrz: { x: 0, y: 0, w: 0, h: 0, screenW: 0, screenH: 0 },
   // crop state
   crop: { scale: 1, tx: 0, ty: 0, imgW: 0, imgH: 0, vpW: 0, vpH: 0 },
   touch: { active: false, lastX: 0, lastY: 0, pinchDist: 0, isPinch: false }
@@ -452,6 +460,9 @@ function drawVfOverlay(){
   const mrzH=paspH*0.225;
   const mrzY=paspY+paspH-mrzH;
 
+  // Save MRZ rect for auto-align after capture
+  S.vfMrz = { x: paspX, y: mrzY, w: pW, h: mrzH, screenW: W, screenH: H };
+
   // Dark mask everywhere except passport area
   const mask=`M0,0 H${W} V${H} H0 Z M${paspX},${paspY} h${pW} v${paspH} h-${pW} Z`;
   svg.innerHTML=`
@@ -515,9 +526,12 @@ function capture(){
   c.width=video.videoWidth||1280;c.height=video.videoHeight||720;
   c.getContext('2d').drawImage(video,0,0);
   const url=c.toDataURL('image/jpeg',0.93);
+  // Snapshot MRZ zone coords and video dimensions before closing viewfinder
+  const snapMrz={...S.vfMrz};
+  const vidW=video.videoWidth||1280, vidH=video.videoHeight||720;
   closeViewfinder();
-  loadImageToCrop(url);
-  setStatus('camStatus','ok','Captured — drag to align MRZ then Analyze');
+  loadImageToCrop(url, snapMrz, vidW, vidH);
+  setStatus('camStatus','ok','Photo captured — MRZ aligned automatically');
 }
 function uploadImage(e){
   const f=e.target.files[0];if(!f)return;
@@ -530,7 +544,7 @@ function uploadImage(e){
 }
 
 // ── CROP / PAN-ZOOM ────────────────────────────────────────────────
-function loadImageToCrop(dataUrl){
+function loadImageToCrop(dataUrl, snapMrz, vidW, vidH){
   S.capturedDataUrl=dataUrl;
   const img=document.getElementById('cropImg');
   img.onload=()=>{
@@ -539,9 +553,12 @@ function loadImageToCrop(dataUrl){
     const vp=document.getElementById('cropViewport');
     S.crop.vpW=vp.clientWidth;
     S.crop.vpH=vp.clientHeight;
-    // Position MRZ box: bottom 23% of viewport height, full width with 5% padding
     positionMrzBox();
-    resetCrop();
+    if(snapMrz && vidW && vidH){
+      autoAlignMrz(snapMrz, vidW, vidH);
+    } else {
+      resetCrop();
+    }
   };
   img.src=dataUrl;
   document.getElementById('cropPanel').classList.add('open');
@@ -575,6 +592,75 @@ function resetCrop(){
   applyCrop();
   document.getElementById('zoomSlider').value=sc;
   document.getElementById('zoomLabel').textContent=sc.toFixed(2)+'×';
+}
+
+function autoAlignMrz(snapMrz, vidW, vidH){
+  // snapMrz: {x,y,w,h,screenW,screenH} — MRZ box position on screen at capture time
+  // vidW/vidH — actual video frame resolution
+  // Goal: make the MRZ region of the photo land exactly inside #cropMrzBox
+
+  const c = S.crop;
+  const vp = document.getElementById('cropViewport');
+  const vpW = vp.clientWidth, vpH = vp.clientHeight;
+
+  // --- Step 1: figure out what part of the video frame was visible on screen ---
+  // Video is object-fit:cover inside fullscreen (snapMrz.screenW x snapMrz.screenH)
+  const screenW = snapMrz.screenW, screenH = snapMrz.screenH;
+  const vidAspect = vidW / vidH;
+  const screenAspect = screenW / screenH;
+
+  let renderW, renderH, offsetX, offsetY;
+  if (vidAspect > screenAspect) {
+    // video wider than screen → letterbox on sides
+    renderH = screenH;
+    renderW = screenH * vidAspect;
+    offsetX = (renderW - screenW) / 2;
+    offsetY = 0;
+  } else {
+    // video taller than screen → letterbox top/bottom
+    renderW = screenW;
+    renderH = screenW / vidAspect;
+    offsetX = 0;
+    offsetY = (renderH - screenH) / 2;
+  }
+
+  // --- Step 2: MRZ box in video pixels ---
+  const scaleVid = vidW / renderW; // screen px → video px
+  const mrzInVid = {
+    x: (snapMrz.x + offsetX) * scaleVid,
+    y: (snapMrz.y + offsetY) * scaleVid,
+    w: snapMrz.w * scaleVid,
+    h: snapMrz.h * scaleVid,
+  };
+
+  // Center of MRZ in video pixels
+  const mrzCenterVidX = mrzInVid.x + mrzInVid.w / 2;
+  const mrzCenterVidY = mrzInVid.y + mrzInVid.h / 2;
+
+  // --- Step 3: target MRZ box in crop viewport ---
+  const box = document.getElementById('cropMrzBox');
+  const boxRect = box.getBoundingClientRect();
+  const vpRect = vp.getBoundingClientRect();
+  const targetX = boxRect.left - vpRect.left + boxRect.width / 2;
+  const targetY = boxRect.top  - vpRect.top  + boxRect.height / 2;
+
+  // --- Step 4: choose scale so MRZ height in image fits crop MRZ box height ---
+  // With a little padding (0.85) so MRZ is slightly larger than the box
+  const desiredScale = (boxRect.height / mrzInVid.h) * 0.85;
+  const scale = Math.min(4, Math.max(0.3, desiredScale));
+
+  // --- Step 5: compute tx/ty so mrzCenter lands on targetX/targetY ---
+  // image px → viewport px: imgPx * scale + tx = vpPx
+  const tx = targetX - mrzCenterVidX * scale;
+  const ty = targetY - mrzCenterVidY * scale;
+
+  c.scale = scale;
+  c.tx = tx;
+  c.ty = ty;
+
+  applyCrop();
+  document.getElementById('zoomSlider').value = scale;
+  document.getElementById('zoomLabel').textContent = scale.toFixed(2) + '×';
 }
 
 function clampCrop(){
@@ -720,7 +806,7 @@ JSON schema:
 {"line1":"<44 chars>","line2":"<44 chars>","confidence":0-100,"warnings":[],"notes":""}`;
 
   try{
-    const res=await fetch('https://api.anthropic.com/v1/messages',{
+    const res=await fetch(PROXY_URL,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
